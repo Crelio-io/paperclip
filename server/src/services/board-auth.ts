@@ -10,6 +10,7 @@ import {
   instanceUserRoles,
 } from "@paperclipai/db";
 import { conflict, forbidden, notFound } from "../errors.js";
+import { revokeCrelioV6ControllerGrantsForBoardKey } from "./crelio-v6-key-revocation.js";
 
 export const BOARD_API_KEY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export const CLI_AUTH_CHALLENGE_TTL_MS = 10 * 60 * 1000;
@@ -152,12 +153,17 @@ export function boardAuthService(db: Db) {
 
   async function revokeBoardApiKey(id: string) {
     const now = new Date();
-    return db
-      .update(boardApiKeys)
-      .set({ revokedAt: now, lastUsedAt: now })
-      .where(and(eq(boardApiKeys.id, id), isNull(boardApiKeys.revokedAt)))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    return db.transaction(async (tx) => {
+      const revoked = await tx
+        .update(boardApiKeys)
+        .set({ revokedAt: now, lastUsedAt: now })
+        .where(and(eq(boardApiKeys.id, id), isNull(boardApiKeys.revokedAt)))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!revoked) return null;
+      await revokeCrelioV6ControllerGrantsForBoardKey(tx, id, now);
+      return revoked;
+    });
   }
 
   async function createNamedBoardApiKey(input: {

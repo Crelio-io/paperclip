@@ -200,6 +200,24 @@ import {
   toolPolicyTestRequestSchema,
   createToolMcpGatewaySchema,
 } from "@paperclipai/shared";
+import {
+  crelioV6ActivateControllerKeyRotationSchema,
+  crelioV6ActivateGenerationSchema,
+  crelioV6ApprovalSubjectSchema,
+  crelioV6CloseRootSchema,
+  crelioV6CompletionSchema,
+  crelioV6ControllerKeyProbeSchema,
+  crelioV6CreateIssueSchema,
+  crelioV6ExternalLifecycleSchema,
+  crelioV6FenceSchema,
+  crelioV6FinalDecisionSchema,
+  crelioV6FinalizeApprovalSubjectSchema,
+  crelioV6FreezeLegacySchema,
+  crelioV6PrepareControllerKeyRotationSchema,
+  crelioV6PrepareSchema,
+  crelioV6ProviderReceiptSchema,
+  crelioV6ReconcileCre32Schema,
+} from "./crelio-v6.js";
 
 type JsonSchema = Record<string, unknown>;
 type OpenApiResponse = Record<string, unknown>;
@@ -725,6 +743,31 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/board-api-keys",
   "POST /api/board-api-keys",
   "DELETE /api/board-api-keys/{keyId}",
+  "GET /api/projects/{projectId}/v6-generation",
+  "GET /api/projects/{projectId}/v6-budget-overview",
+  "GET /api/projects/{projectId}/v6-diagnostics",
+  "GET /api/projects/{projectId}/v6-legacy-inventory",
+  "POST /api/projects/{projectId}/v6-legacy-freeze",
+  "POST /api/projects/{projectId}/v6-reconcile-cre32",
+  "POST /api/projects/{projectId}/v6-generation/prepare",
+  "POST /api/projects/{projectId}/v6-generation/activate",
+  "POST /api/projects/{projectId}/v6-generation/fence",
+  "POST /api/projects/{projectId}/v6-controller-key/prepare-rotation",
+  "POST /api/projects/{projectId}/v6-controller-key/probe",
+  "POST /api/projects/{projectId}/v6-controller-key/activate-rotation",
+  "POST /api/projects/{projectId}/v6/issues",
+  "POST /api/issues/{issueId}/v6-activate",
+  "POST /api/issues/{issueId}/v6-reopen",
+  "POST /api/issues/{issueId}/v6-provider-receipt",
+  "GET /api/issues/{issueId}/v6-provider-evidence",
+  "GET /api/projects/{projectId}/v6-operator-session",
+  "POST /api/issues/{issueId}/v6-approval-subject",
+  "POST /api/issues/{issueId}/v6-approval-subject/finalize",
+  "POST /api/issues/{issueId}/v6-decision",
+  "GET /api/issues/{issueId}/v6-integration-evidence",
+  "POST /api/issues/{issueId}/v6-close-root",
+  "GET /api/projects/{projectId}/v6-events",
+  "GET /api/projects/{projectId}/v6-snapshot",
   "POST /api/bootstrap/claim",
   "GET /api/companies/{companyId}/resource-memberships/me",
   "PUT /api/companies/{companyId}/resource-memberships/me/agents/{agentId}",
@@ -1259,6 +1302,26 @@ registry.registerPath({
 });
 
 // ─── Teams Catalog ──────────────────────────────────────────────────────────
+
+const crelioV6OpenApiBodies: Record<string, z.ZodTypeAny> = {
+  "/api/projects/{projectId}/v6-legacy-freeze": crelioV6FreezeLegacySchema,
+  "/api/projects/{projectId}/v6-reconcile-cre32": crelioV6ReconcileCre32Schema,
+  "/api/projects/{projectId}/v6-generation/prepare": crelioV6PrepareSchema,
+  "/api/projects/{projectId}/v6-generation/activate": crelioV6ActivateGenerationSchema,
+  "/api/projects/{projectId}/v6-generation/fence": crelioV6FenceSchema,
+  "/api/projects/{projectId}/v6-controller-key/prepare-rotation": crelioV6PrepareControllerKeyRotationSchema,
+  "/api/projects/{projectId}/v6-controller-key/probe": crelioV6ControllerKeyProbeSchema,
+  "/api/projects/{projectId}/v6-controller-key/activate-rotation": crelioV6ActivateControllerKeyRotationSchema,
+  "/api/projects/{projectId}/v6/issues": crelioV6CreateIssueSchema,
+  "/api/issues/{issueId}/v6-activate": crelioV6ExternalLifecycleSchema,
+  "/api/issues/{issueId}/v6-reopen": crelioV6ExternalLifecycleSchema,
+  "/api/issues/{issueId}/v6-complete": crelioV6CompletionSchema,
+  "/api/issues/{issueId}/v6-provider-receipt": crelioV6ProviderReceiptSchema,
+  "/api/issues/{issueId}/v6-approval-subject": crelioV6ApprovalSubjectSchema,
+  "/api/issues/{issueId}/v6-approval-subject/finalize": crelioV6FinalizeApprovalSubjectSchema,
+  "/api/issues/{issueId}/v6-decision": crelioV6FinalDecisionSchema,
+  "/api/issues/{issueId}/v6-close-root": crelioV6CloseRootSchema,
+};
 
 for (const route of [
   ["get", "/api/teams/catalog", "List catalog teams"],
@@ -5395,6 +5458,43 @@ registerCurrentRoute({
   tags: ["access"],
   summary: "Revoke a board API key",
 });
+
+for (const route of [
+  ["get", "/api/projects/{projectId}/v6-generation", "Read the V6 project generation policy"],
+  ["get", "/api/projects/{projectId}/v6-budget-overview", "Read bounded V6 budget admission evidence"],
+  ["get", "/api/projects/{projectId}/v6-diagnostics", "Read exact V6 controller diagnostics"],
+  ["get", "/api/projects/{projectId}/v6-legacy-inventory", "Preview the frozen legacy inventory"],
+  ["post", "/api/projects/{projectId}/v6-legacy-freeze", "Freeze all nonterminal legacy article execution"],
+  ["post", "/api/projects/{projectId}/v6-reconcile-cre32", "Reconcile the terminal CRE-32 archival record"],
+  ["post", "/api/projects/{projectId}/v6-generation/prepare", "Prepare one fail-closed V6 generation"],
+  ["post", "/api/projects/{projectId}/v6-generation/activate", "Activate the exact prepared V6 generation"],
+  ["post", "/api/projects/{projectId}/v6-generation/fence", "Advance an active or prepared controller fence"],
+  ["post", "/api/projects/{projectId}/v6-controller-key/prepare-rotation", "Prepare an exact successor controller key"],
+  ["post", "/api/projects/{projectId}/v6-controller-key/probe", "Probe a prepared controller-key successor"],
+  ["post", "/api/projects/{projectId}/v6-controller-key/activate-rotation", "Activate and revoke a controller-key predecessor"],
+  ["post", "/api/projects/{projectId}/v6/issues", "Create one canonical controller-owned V6 issue"],
+  ["post", "/api/issues/{issueId}/v6-activate", "Activate one V6 phase with a one-time lifecycle nonce"],
+  ["post", "/api/issues/{issueId}/v6-reopen", "Reopen one V6 phase with a fresh lifecycle nonce"],
+  ["post", "/api/issues/{issueId}/v6-complete", "Atomically complete a V6 run with its bounded handoff"],
+  ["post", "/api/issues/{issueId}/v6-provider-receipt", "Bind an immutable provider authorization receipt"],
+  ["get", "/api/issues/{issueId}/v6-provider-evidence", "Read non-secret provider authorization evidence"],
+  ["get", "/api/projects/{projectId}/v6-operator-session", "Revalidate the configured human board participant"],
+  ["post", "/api/issues/{issueId}/v6-approval-subject", "Install the frozen Final Handoff approval subject"],
+  ["post", "/api/issues/{issueId}/v6-approval-subject/finalize", "Finalize the handoff barrier for approval"],
+  ["post", "/api/issues/{issueId}/v6-decision", "Record the exact human Final Handoff decision"],
+  ["get", "/api/issues/{issueId}/v6-integration-evidence", "Read the exact approved integration subject"],
+  ["post", "/api/issues/{issueId}/v6-close-root", "Close a terminal integrated V6 root"],
+  ["get", "/api/projects/{projectId}/v6-events", "Read the contiguous bounded V6 event journal"],
+  ["get", "/api/projects/{projectId}/v6-snapshot", "Read a complete keyset-paged transactional V6 snapshot"],
+] as const) {
+  registerCurrentRoute({
+    method: route[0],
+    path: route[1],
+    tags: ["crelio-v6"],
+    summary: route[2],
+    body: crelioV6OpenApiBodies[route[1]],
+  });
+}
 
 for (const route of [
   ["get", "/api/companies/import/jobs/{jobId}", "Get company import job status"],

@@ -24,6 +24,7 @@ import { agentRoutes } from "./routes/agents.js";
 import { projectRoutes } from "./routes/projects.js";
 import { issueRoutes } from "./routes/issues.js";
 import { issueTreeControlRoutes } from "./routes/issue-tree-control.js";
+import { crelioV6Routes, crelioV6StockMutationGuard } from "./routes/crelio-v6.js";
 import { caseRoutes } from "./routes/cases.js";
 import { fileResourceRoutes } from "./routes/file-resources.js";
 import { routineRoutes } from "./routes/routines.js";
@@ -141,6 +142,26 @@ export function shouldEnablePrivateHostnameGuard(opts: {
   );
 }
 
+export function crelioV6MaintenanceMutationGuard(): express.RequestHandler {
+  return (req, res, next) => {
+    if (process.env.CRELIO_V6_MAINTENANCE_MODE !== "1") return next();
+    if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+    if (req.path.startsWith("/api/auth/")) return next();
+    const allowed = [
+      /^\/api\/projects\/[0-9a-f-]{36}\/v6-legacy-freeze$/i,
+      /^\/api\/projects\/[0-9a-f-]{36}\/v6-reconcile-cre32$/i,
+      /^\/api\/projects\/[0-9a-f-]{36}\/v6-generation\/(prepare|activate|fence)$/i,
+    ];
+    if (req.method === "POST" && allowed.some((pattern) => pattern.test(req.path))) {
+      return next();
+    }
+    return res.status(503).json({
+      error: "Crelio V6 guarded cutover maintenance mode denies this mutation",
+      code: "crelio_v6_maintenance_mode",
+    });
+  };
+}
+
 export async function createApp(
   db: Db,
   opts: {
@@ -214,6 +235,7 @@ export async function createApp(
       resolveSession: opts.resolveSession,
     }),
   );
+  app.use(crelioV6MaintenanceMutationGuard());
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
@@ -226,6 +248,8 @@ export async function createApp(
   // Mount API routes
   const api = Router();
   api.use(boardMutationGuard());
+  api.use(crelioV6StockMutationGuard(db));
+  api.use(crelioV6Routes(db));
   api.use(
     "/health",
     healthRoutes(db, {

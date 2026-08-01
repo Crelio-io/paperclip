@@ -11,6 +11,9 @@ import {
   assets,
   companies,
   companyMemberships,
+  crelioV6IssueBindings,
+  crelioV6LifecycleAuthorizations,
+  crelioV6ProjectPolicies,
   documentRevisions,
   documents,
   goals,
@@ -593,7 +596,33 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type DbOrTransaction = Db | DbTransaction;
+type CrelioV6CheckoutJournalInput = {
+  binding: typeof crelioV6IssueBindings.$inferSelect;
+  issue: typeof issues.$inferSelect;
+  issueVersion: number;
+  runId: string;
+};
+
+async function crelioV6IssueGuard(dbOrTx: DbOrTransaction, issueId: string) {
+  const row = await dbOrTx.select({ projectId: issues.projectId }).from(issues)
+    .where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+  if (!row?.projectId) return null;
+  const binding = await dbOrTx.select().from(crelioV6IssueBindings)
+    .where(eq(crelioV6IssueBindings.issueId, issueId)).then((rows) => rows[0] ?? null);
+  const policy = await dbOrTx.select().from(crelioV6ProjectPolicies)
+    .where(eq(crelioV6ProjectPolicies.projectId, row.projectId)).then((rows) => rows[0] ?? null);
+  if (!policy || policy.schemaFloor < 6) return null;
+  return { binding, policy, legacy: !binding };
+}
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
+  /**
+   * Internal capability bit used only by the maintained V6 controller service.
+   * `originKind` is provenance, not authorization: accepting `crelio_v6` on its
+   * own would let another internal caller bypass the project schema floor.
+   */
+  crelioV6AuthorizedCreate?: boolean;
   labelIds?: string[];
   blockedByIssueIds?: string[];
   inheritExecutionWorkspaceFromIssueId?: string | null;
@@ -6136,8 +6165,9 @@ export function issueService(db: Db) {
       });
     },
 
-    create: async (companyId: string, data: IssueCreateInput) => {
+    create: async (companyId: string, data: IssueCreateInput, dbOrTx: DbOrTransaction = db) => {
       const {
+        crelioV6AuthorizedCreate,
         labelIds: inputLabelIds,
         blockedByIssueIds,
         inheritExecutionWorkspaceFromIssueId,
@@ -6152,6 +6182,25 @@ export function issueService(db: Db) {
         onDeduplicated,
         ...issueData
       } = data;
+      if (issueData.originKind === "crelio_v6" && crelioV6AuthorizedCreate !== true) {
+        throw conflict("Schema-v6 issue creation requires the dedicated controller service");
+      }
+      if (issueData.originKind !== "crelio_v6") {
+        let targetProjectId = issueData.projectId ?? null;
+        if (!targetProjectId && issueData.parentId) {
+          targetProjectId = await dbOrTx.select({ projectId: issues.projectId }).from(issues)
+            .where(eq(issues.id, issueData.parentId)).then((rows) => rows[0]?.projectId ?? null);
+        }
+        if (targetProjectId) {
+          const policy = await dbOrTx.select({ schemaFloor: crelioV6ProjectPolicies.schemaFloor })
+            .from(crelioV6ProjectPolicies)
+            .where(eq(crelioV6ProjectPolicies.projectId, targetProjectId))
+            .then((rows) => rows[0] ?? null);
+          if (policy && policy.schemaFloor >= 6) {
+            throw conflict("Stock and internal issue creation are frozen for an active schema-v6 project");
+          }
+        }
+      }
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -6170,7 +6219,7 @@ export function issueService(db: Db) {
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
-      return db.transaction(async (tx) => {
+      const runCreate = async (tx: DbOrTransaction) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (allowDuplicate === false) {
@@ -6461,7 +6510,8 @@ export function issueService(db: Db) {
         const [enriched] = await withIssueLabels(tx, [issue]);
         const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
         return withRelations;
-      });
+      };
+      return dbOrTx === db ? db.transaction(runCreate) : runCreate(dbOrTx);
     },
 
     update: async (
@@ -6480,6 +6530,18 @@ export function issueService(db: Db) {
         .where(eq(issues.id, id))
         .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
       if (!existing) return null;
+      if (existing.projectId) {
+        const binding = await dbOrTx.select({ issueId: crelioV6IssueBindings.issueId }).from(crelioV6IssueBindings)
+          .where(eq(crelioV6IssueBindings.issueId, id)).then((rows: Array<{ issueId: string }>) => rows[0] ?? null);
+        const policy = await dbOrTx.select({ schemaFloor: crelioV6ProjectPolicies.schemaFloor }).from(crelioV6ProjectPolicies)
+          .where(eq(crelioV6ProjectPolicies.projectId, existing.projectId))
+          .then((rows: Array<{ schemaFloor: number }>) => rows[0] ?? null);
+        if (policy && policy.schemaFloor >= 6) {
+          throw conflict(binding
+            ? "Schema-v6 issue mutation requires its dedicated lifecycle endpoint"
+            : "Legacy issue mutation is frozen by the active schema-v6 project floor");
+        }
+      }
 
       const {
         labelIds: nextLabelIds,
@@ -6784,7 +6846,18 @@ export function issueService(db: Db) {
         return enriched;
       }),
 
-    checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
+    checkout: async (
+      id: string,
+      agentId: string,
+      expectedStatuses: string[],
+      checkoutRunId: string | null,
+      options?: {
+        crelioV6TransactionHook?: (
+          tx: DbTransaction,
+          input: CrelioV6CheckoutJournalInput,
+        ) => Promise<void>;
+      },
+    ) => {
       const issueCompany = await db
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -6792,6 +6865,20 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!issueCompany) throw notFound("Issue not found");
       await assertAssignableAgent(db, issueCompany.companyId, agentId, { kind: "work" });
+      const v6Guard = await crelioV6IssueGuard(db, id);
+      if (v6Guard) {
+        if (v6Guard.legacy || !checkoutRunId) {
+          throw conflict("Issue checkout is frozen by the active schema-v6 lifecycle owner");
+        }
+        const authorization = await db.select().from(crelioV6LifecycleAuthorizations).where(and(
+          eq(crelioV6LifecycleAuthorizations.issueId, id),
+          eq(crelioV6LifecycleAuthorizations.consumingRunId, checkoutRunId),
+          eq(crelioV6LifecycleAuthorizations.expectedAssigneeAgentId, agentId),
+        )).then((rows) => rows[0] ?? null);
+        if (!authorization || authorization.generation !== v6Guard.binding!.generation) {
+          throw conflict("Schema-v6 checkout requires the exact consumed lifecycle authorization");
+        }
+      }
 
       const now = new Date();
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issueCompany.companyId, id);
@@ -6826,31 +6913,71 @@ export function issueService(db: Db) {
       const executionLockCondition = checkoutRunId
         ? or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId))
         : isNull(issues.executionRunId);
-      const updated = await db
-        .update(issues)
-        .set({
-          assigneeAgentId: agentId,
-          assigneeUserId: null,
-          checkoutRunId,
-          executionRunId: checkoutRunId,
-          status: "in_progress",
-          startedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, id),
-            inArray(issues.status, expectedStatuses),
-            or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
-            executionLockCondition,
-          ),
-        )
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const updated = await db.transaction(async (tx) => {
+        let lockedBinding: typeof crelioV6IssueBindings.$inferSelect | null = null;
+        if (v6Guard?.binding) {
+          if (!checkoutRunId || !options?.crelioV6TransactionHook) {
+            throw conflict("Schema-v6 checkout requires its journaled adapter-admission path");
+          }
+          await tx.execute(sql`select issue_id from crelio_v6_issue_bindings where issue_id = ${id} for update`);
+          lockedBinding = await tx.select().from(crelioV6IssueBindings)
+            .where(eq(crelioV6IssueBindings.issueId, id)).then((rows) => rows[0] ?? null);
+          if (
+            !lockedBinding ||
+            lockedBinding.generation !== v6Guard.binding.generation ||
+            lockedBinding.lifecycleState !== "running"
+          ) {
+            throw conflict("Schema-v6 checkout binding changed after lifecycle admission");
+          }
+        }
+        const row = await tx
+          .update(issues)
+          .set({
+            assigneeAgentId: agentId,
+            assigneeUserId: null,
+            checkoutRunId,
+            executionRunId: checkoutRunId,
+            status: "in_progress",
+            startedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, id),
+              inArray(issues.status, expectedStatuses),
+              or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+              executionLockCondition,
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (row && lockedBinding && checkoutRunId) {
+          const nextIssueVersion = lockedBinding.issueVersion + 1;
+          const bindingUpdate = await tx.update(crelioV6IssueBindings).set({
+            issueVersion: nextIssueVersion,
+            updatedAt: now,
+          }).where(and(
+            eq(crelioV6IssueBindings.issueId, id),
+            eq(crelioV6IssueBindings.issueVersion, lockedBinding.issueVersion),
+          )).returning().then((rows) => rows[0] ?? null);
+          if (!bindingUpdate) throw conflict("Schema-v6 checkout lost its issue-version race");
+          await options!.crelioV6TransactionHook!(tx, {
+            binding: bindingUpdate,
+            issue: row,
+            issueVersion: nextIssueVersion,
+            runId: checkoutRunId,
+          });
+        }
+        return row;
+      });
 
       if (updated) {
         const [enriched] = await withIssueLabels(db, [updated]);
         return enriched;
+      }
+
+      if (v6Guard) {
+        throw conflict("Schema-v6 checkout failed its exact single-run precondition");
       }
 
       const current = await db
@@ -7137,6 +7264,9 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null);
 
         if (!existing) return null;
+        if (await crelioV6IssueGuard(tx, id)) {
+          throw conflict("Schema-v6 issue release is externally owned");
+        }
         if (actorAgentId && existing.assigneeAgentId && existing.assigneeAgentId !== actorAgentId) {
           throw conflict("Only assignee can release issue");
         }
@@ -7194,6 +7324,9 @@ export function issueService(db: Db) {
           .where(eq(issues.id, id))
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
+        if (await crelioV6IssueGuard(tx, id)) {
+          throw conflict("Schema-v6 issue administrative release is externally owned");
+        }
 
         const patch: Partial<typeof issues.$inferInsert> = {
           checkoutRunId: null,
@@ -7448,6 +7581,9 @@ export function issueService(db: Db) {
         .then((rows: Array<{ companyId: string }>) => rows[0] ?? null);
 
       if (!issue) throw notFound("Issue not found");
+      if (await crelioV6IssueGuard(dbOrTx, issueId)) {
+        throw conflict("Schema-v6 comments require the atomic completion or human-decision endpoint");
+      }
 
       const currentUserRedactionOptions = {
         enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -7505,27 +7641,27 @@ export function issueService(db: Db) {
       originalFilename?: string | null;
       createdByAgentId?: string | null;
       createdByUserId?: string | null;
-    }) => {
-      const issue = await db
-        .select({ id: issues.id, companyId: issues.companyId })
-        .from(issues)
-        .where(eq(issues.id, input.issueId))
-        .then((rows) => rows[0] ?? null);
-      if (!issue) throw notFound("Issue not found");
-
-      if (input.issueCommentId) {
-        const comment = await db
-          .select({ id: issueComments.id, companyId: issueComments.companyId, issueId: issueComments.issueId })
-          .from(issueComments)
-          .where(eq(issueComments.id, input.issueCommentId))
+    }, txOverride?: DbTransaction) => {
+      const createInTransaction = async (tx: DbOrTransaction) => {
+        const issue = await tx
+          .select({ id: issues.id, companyId: issues.companyId })
+          .from(issues)
+          .where(eq(issues.id, input.issueId))
           .then((rows) => rows[0] ?? null);
-        if (!comment) throw notFound("Issue comment not found");
-        if (comment.companyId !== issue.companyId || comment.issueId !== issue.id) {
-          throw unprocessable("Attachment comment must belong to same issue and company");
-        }
-      }
+        if (!issue) throw notFound("Issue not found");
 
-      return db.transaction(async (tx) => {
+        if (input.issueCommentId) {
+          const comment = await tx
+            .select({ id: issueComments.id, companyId: issueComments.companyId, issueId: issueComments.issueId })
+            .from(issueComments)
+            .where(eq(issueComments.id, input.issueCommentId))
+            .then((rows) => rows[0] ?? null);
+          if (!comment) throw notFound("Issue comment not found");
+          if (comment.companyId !== issue.companyId || comment.issueId !== issue.id) {
+            throw unprocessable("Attachment comment must belong to same issue and company");
+          }
+        }
+
         const [asset] = await tx
           .insert(assets)
           .values({
@@ -7568,7 +7704,8 @@ export function issueService(db: Db) {
           createdAt: attachment.createdAt,
           updatedAt: attachment.updatedAt,
         };
-      });
+      };
+      return txOverride ? createInTransaction(txOverride) : db.transaction(createInTransaction);
     },
 
     listAttachments: async (issueId: string) =>
@@ -7619,8 +7756,8 @@ export function issueService(db: Db) {
         .where(eq(issueAttachments.id, id))
         .then((rows) => rows[0] ?? null),
 
-    removeAttachment: async (id: string) =>
-      db.transaction(async (tx) => {
+    removeAttachment: async (id: string, txOverride?: DbTransaction) => {
+      const removeInTransaction = async (tx: DbOrTransaction) => {
         const existing = await tx
           .select({
             id: issueAttachments.id,
@@ -7648,7 +7785,9 @@ export function issueService(db: Db) {
         await tx.delete(issueAttachments).where(eq(issueAttachments.id, id));
         await tx.delete(assets).where(eq(assets.id, existing.assetId));
         return existing;
-      }),
+      };
+      return txOverride ? removeInTransaction(txOverride) : db.transaction(removeInTransaction);
+    },
 
     findMentionedAgents: async (companyId: string, body: string) => {
       const explicitAgentMentionIds = extractAgentMentionIds(body);

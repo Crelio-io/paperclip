@@ -40,6 +40,8 @@ import {
 } from "./workspace-runtime-read-model.js";
 
 type ExecutionWorkspaceRow = typeof executionWorkspaces.$inferSelect;
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type DbOrTransaction = Db | DbTransaction;
 type WorkspaceRuntimeServiceRow = typeof workspaceRuntimeServices.$inferSelect;
 type RuntimeServiceReadDb = Pick<Db, "select">;
 const execFileAsync = promisify(execFile);
@@ -1595,8 +1597,13 @@ export function executionWorkspaceService(db: Db) {
       return row ? toExecutionWorkspace(row) : null;
     },
 
-    update: async (id: string, patch: Partial<typeof executionWorkspaces.$inferInsert>) => {
-      const row = await db
+    update: async (
+      id: string,
+      patch: Partial<typeof executionWorkspaces.$inferInsert>,
+      txOverride?: DbTransaction,
+    ) => {
+      const dbOrTx: DbOrTransaction = txOverride ?? db;
+      const row = await dbOrTx
         .update(executionWorkspaces)
         .set({ ...patch, updatedAt: new Date() })
         .where(eq(executionWorkspaces.id, id))

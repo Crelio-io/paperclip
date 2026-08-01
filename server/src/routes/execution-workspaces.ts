@@ -1,7 +1,13 @@
 import { and, eq } from "drizzle-orm";
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
-import { issues, projects, projectWorkspaces } from "@paperclipai/db";
+import {
+  crelioV6IssueBindings,
+  executionWorkspaces,
+  issues,
+  projects,
+  projectWorkspaces,
+} from "@paperclipai/db";
 import {
   findWorkspaceCommandDefinition,
   matchWorkspaceRuntimeServiceToCommand,
@@ -34,6 +40,10 @@ import {
 import { assertCanManageExecutionWorkspaceRuntimeServices } from "./workspace-runtime-service-authz.js";
 import { appendWithCap } from "../adapters/utils.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
+import {
+  appendCrelioV6WorkspaceStatusJournal,
+  assertCrelioV6ControllerGrant,
+} from "../services/crelio-v6.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
@@ -70,6 +80,53 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     if (decision.allowed) return true;
     res.status(403).json({ error: "Runtime service control is outside this actor's authorization boundary" });
     return false;
+  }
+
+  async function findCrelioV6WorkspaceBinding(
+    workspace: typeof executionWorkspaces.$inferSelect,
+  ) {
+    if (!workspace.projectId || !workspace.sourceIssueId) return null;
+    return db
+      .select({ generation: crelioV6IssueBindings.generation })
+      .from(crelioV6IssueBindings)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.id, crelioV6IssueBindings.issueId),
+          eq(issues.executionWorkspaceId, workspace.id),
+          eq(issues.companyId, workspace.companyId),
+        ),
+      )
+      .where(and(
+        eq(crelioV6IssueBindings.issueId, workspace.sourceIssueId),
+        eq(crelioV6IssueBindings.projectId, workspace.projectId),
+      ))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function assertExactCrelioV6WorkspaceClose(
+    req: Request,
+    workspace: typeof executionWorkspaces.$inferSelect,
+    binding: { generation: string },
+  ) {
+    if (Object.keys(req.body ?? {}).length !== 1 || req.body?.status !== "archived") {
+      return false;
+    }
+    const rawFence = req.header("x-crelio-controller-generation")?.trim();
+    const fencingGeneration = rawFence ? Number(rawFence) : NaN;
+    if (!Number.isSafeInteger(fencingGeneration) || fencingGeneration < 1) return false;
+    try {
+      await assertCrelioV6ControllerGrant(db, {
+        actor: req.actor,
+        projectId: workspace.projectId,
+        generation: binding.generation,
+        operation: "workspace.close",
+        fencingGeneration,
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   router.get("/companies/:companyId/execution-workspaces", async (req, res) => {
@@ -574,7 +631,15 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Execution workspace not found");
     if (!existing) return;
-    if (!(await assertRuntimeManageAllowed(req, res, existing.companyId))) return;
+    const v6Binding = await findCrelioV6WorkspaceBinding(existing);
+    if (v6Binding) {
+      if (!(await assertExactCrelioV6WorkspaceClose(req, existing, v6Binding))) {
+        res.status(403).json({
+          error: "V6 workspaces may only be archived by the exact active controller grant",
+        });
+        return;
+      }
+    } else if (!(await assertRuntimeManageAllowed(req, res, existing.companyId))) return;
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectExecutionWorkspaceCommandPaths({
@@ -608,6 +673,14 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     const configForCleanup = readExecutionWorkspaceConfig(
       ((patch.metadata as Record<string, unknown> | null | undefined) ?? (existing.metadata as Record<string, unknown> | null)) ?? null,
     );
+    const updateWorkspace = async (workspacePatch: Record<string, unknown>) => db.transaction(async (tx) => {
+      const updated = await svc.update(id, workspacePatch, tx);
+      if (!updated) return null;
+      const raw = await tx.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (raw) await appendCrelioV6WorkspaceStatusJournal(tx, raw);
+      return updated;
+    });
 
     if (req.body.status === "archived" && existing.status !== "archived") {
       const readiness = await svc.getCloseReadiness(existing.id);
@@ -625,7 +698,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       }
 
       const closedAt = new Date();
-      const archivedWorkspace = await svc.update(id, {
+      const archivedWorkspace = await updateWorkspace({
         ...patch,
         status: "archived",
         closedAt,
@@ -707,12 +780,12 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
           cleanupPatch.status = "cleanup_failed";
         }
         if (cleanupResult.warnings.length > 0 || !cleanupResult.cleaned) {
-          workspace = (await svc.update(id, cleanupPatch)) ?? workspace;
+          workspace = (await updateWorkspace(cleanupPatch)) ?? workspace;
         }
       } catch (error) {
         const failureReason = error instanceof Error ? error.message : String(error);
         workspace =
-          (await svc.update(id, {
+          (await updateWorkspace({
             status: "cleanup_failed",
             closedAt,
             cleanupReason: failureReason,
@@ -723,7 +796,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         return;
       }
     } else {
-      const updatedWorkspace = await svc.update(id, patch);
+      const updatedWorkspace = await updateWorkspace(patch);
       if (!updatedWorkspace) {
         res.status(404).json({ error: "Execution workspace not found" });
         return;

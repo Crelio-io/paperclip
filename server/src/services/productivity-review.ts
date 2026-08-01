@@ -21,6 +21,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import { isCrelioV6ExecutionFrozenIssue } from "./crelio-v6-ownership.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
@@ -694,6 +695,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     evidence: ProductivityReviewEvidence,
     opts: { prefix: string; thresholds: ProductivityReviewThresholds },
   ) {
+    // V6 owns run ceilings, liveness, holds and human escalation.  Stock
+    // productivity automation must not add an issue, comment, or wake.
+    if (await isCrelioV6ExecutionFrozenIssue(db, evidence.sourceIssue.id)) {
+      return { kind: "v6_controller_owned" as const, reviewIssueId: null };
+    }
     const existing = await findOpenProductivityReview(evidence.sourceIssue.companyId, evidence.sourceIssue.id);
     if (existing) {
       const refreshState = await getRefreshCommentState(evidence.sourceIssue.companyId, existing.id);

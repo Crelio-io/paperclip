@@ -1,6 +1,8 @@
 import { Router } from "express";
 import type { Request } from "express";
 import type { Db } from "@paperclipai/db";
+import { issueTreeHolds } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
 import {
   createIssueTreeHoldSchema,
   isUuidLike,
@@ -10,6 +12,10 @@ import {
 import { validate } from "../middleware/validate.js";
 import { heartbeatService, issueService, issueTreeControlService, logActivity } from "../services/index.js";
 import { assertBoard, getAccessibleResource, getActorInfo } from "./authz.js";
+import {
+  appendCrelioV6TreeHoldJournal,
+  appendCrelioV6WakeStatusJournal,
+} from "../services/crelio-v6.js";
 
 const TREE_RUN_CANCELLATION_RESPONSE_WAIT_MS = 1_000;
 
@@ -17,7 +23,11 @@ function errorToMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function waitForRunCancellationTasks(tasks: Promise<void>[]) {
+async function waitForRunCancellationTasks(tasks: Promise<void>[], waitToCompletion = false) {
+  if (waitToCompletion) {
+    await Promise.all(tasks);
+    return;
+  }
   let timeout: ReturnType<typeof setTimeout> | null = null;
   try {
     await Promise.race([
@@ -75,6 +85,29 @@ export function issueTreeControlRoutes(db: Db) {
     const root = await getAccessibleResource(req, res, resolveRootIssue(req), "Root issue not found");
     if (!root) return;
 
+    const crelioHoldMatch = typeof req.body.reason === "string"
+      ? req.body.reason.match(/^\[crelio-v6-hold:([0-9a-f-]{36})\]/i)
+      : null;
+    let replayed = false;
+    let result: Awaited<ReturnType<typeof treeControlSvc.createHold>> | null = null;
+    if (crelioHoldMatch) {
+      const existing = await db.select({ id: issueTreeHolds.id }).from(issueTreeHolds).where(and(
+        eq(issueTreeHolds.companyId, root.companyId),
+        eq(issueTreeHolds.rootIssueId, root.id),
+        eq(issueTreeHolds.reason, req.body.reason),
+      )).then((rows) => rows[0] ?? null);
+      if (existing) {
+        const hold = await treeControlSvc.getHold(root.companyId, existing.id);
+        if (!hold) throw new Error("Existing Crelio V6 hold could not be read back");
+        const preview = await treeControlSvc.preview(root.companyId, root.id, {
+          mode: req.body.mode,
+          releasePolicy: req.body.releasePolicy,
+        });
+        result = { hold, preview };
+        replayed = true;
+      }
+    }
+
     const actor = getActorInfo(req);
     const actorInput = {
       actorType: actor.actorType,
@@ -83,10 +116,13 @@ export function issueTreeControlRoutes(db: Db) {
       userId: actor.actorType === "user" ? actor.actorId : null,
       runId: actor.runId,
     };
-    let result = await treeControlSvc.createHold(root.companyId, root.id, {
-      ...req.body,
-      actor: actorInput,
-    });
+    if (!result) {
+      result = await treeControlSvc.createHold(root.companyId, root.id, {
+        ...req.body,
+        actor: actorInput,
+        transactionHook: (tx, hold) => appendCrelioV6TreeHoldJournal(tx, root.id, hold).then(() => undefined),
+      });
+    }
     await logActivity(db, {
       companyId: root.companyId,
       actorType: actor.actorType,
@@ -158,6 +194,13 @@ export function issueTreeControlRoutes(db: Db) {
         result.hold.mode === "pause"
           ? "Cancelled because an active subtree pause hold was created"
           : "Cancelled because a subtree cancel operation was applied",
+        crelioHoldMatch
+          ? {
+              transactionHook: async (tx, wakes) => {
+                for (const wake of wakes) await appendCrelioV6WakeStatusJournal(tx, wake);
+              },
+            }
+          : undefined,
       );
       for (const wakeup of cancelledWakeups) {
         await logActivity(db, {
@@ -201,7 +244,7 @@ export function issueTreeControlRoutes(db: Db) {
     }
 
     if (runCancellationTasks.length > 0) {
-      await waitForRunCancellationTasks(runCancellationTasks);
+      await waitForRunCancellationTasks(runCancellationTasks, Boolean(crelioHoldMatch));
     }
 
     if (result.hold.mode === "restore") {
@@ -293,9 +336,20 @@ export function issueTreeControlRoutes(db: Db) {
       }
     }
 
+    const quiescence = crelioHoldMatch && (result.hold.mode === "pause" || result.hold.mode === "cancel")
+      ? await treeControlSvc.readTreeExecutionQuiescence(root.companyId, root.id)
+      : null;
+    const response = { ...result, replayed, ...(quiescence ? { quiescence } : {}) };
+    if (quiescence && !quiescence.quiescent) {
+      return res.status(503).json({
+        ...response,
+        error: "Crelio V6 hold is active but execution quiescence has not completed",
+        code: "crelio_v6_hold_not_quiescent",
+      });
+    }
     res
-      .status(result.hold.mode === "restore" || result.hold.mode === "resume" ? 200 : 201)
-      .json(result);
+      .status(replayed || result.hold.mode === "restore" || result.hold.mode === "resume" ? 200 : 201)
+      .json(response);
   });
 
   router.get("/issues/:id/tree-control/state", async (req, res) => {

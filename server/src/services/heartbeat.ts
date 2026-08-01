@@ -250,6 +250,16 @@ import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import {
+  assertCrelioV6RuntimeContract,
+  appendCrelioV6Journal,
+  appendCrelioV6RunStatusJournal,
+  appendCrelioV6WakeStatusJournal,
+  applyCrelioV6RunWorkspaceIssuePatch,
+  claimCrelioV6LifecycleRun,
+  isCrelioV6ExecutionFrozenIssue,
+  isCrelioV6ExternallyOwnedIssue,
+} from "./crelio-v6.js";
+import {
   clearHeartbeatRunRuntimeStatus,
   getHeartbeatRunRuntimeStatus,
   MAX_HEARTBEAT_RUN_RUNTIME_ASSISTANT_SNIPPET_CHARS,
@@ -7556,12 +7566,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
-    const updated = await db
-      .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
-      .where(eq(heartbeatRuns.id, runId))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const updated = await db.transaction(async (tx) => {
+      const row = await tx
+        .update(heartbeatRuns)
+        .set({ status, ...patch, updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runId))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (row) await appendCrelioV6RunStatusJournal(tx, row);
+      return row;
+    });
 
     if (updated) {
       if (isHeartbeatRunTerminalStatus(updated.status)) {
@@ -7593,12 +7607,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
-    const updated = await db
-      .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
-      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const updated = await db.transaction(async (tx) => {
+      const row = await tx
+        .update(heartbeatRuns)
+        .set({ status, ...patch, updatedAt: new Date() })
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (row) await appendCrelioV6RunStatusJournal(tx, row);
+      return row;
+    });
 
     if (updated) {
       if (isHeartbeatRunTerminalStatus(updated.status)) {
@@ -7676,10 +7694,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     patch?: Partial<typeof agentWakeupRequests.$inferInsert>,
   ) {
     if (!wakeupRequestId) return;
-    await db
-      .update(agentWakeupRequests)
-      .set({ status, ...patch, updatedAt: new Date() })
-      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db.transaction(async (tx) => {
+      const wake = await tx
+        .update(agentWakeupRequests)
+        .set({ status, ...patch, updatedAt: new Date() })
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (wake) await appendCrelioV6WakeStatusJournal(tx, wake);
+    });
   }
 
   async function addContinuationExhaustedCommentOnce(input: {
@@ -7714,6 +7737,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId);
     if (!issueId) return;
+    if (await isCrelioV6ExecutionFrozenIssue(db, issueId)) {
+      logger.info({ runId: run.id, issueId }, "suppressed native liveness continuation for V6 issue");
+      return;
+    }
 
     const [issue, agent] = await Promise.all([
       db
@@ -7911,6 +7938,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     if (!issueId) return;
+    if (await isCrelioV6ExecutionFrozenIssue(db, issueId)) {
+      logger.info({ runId: run.id, issueId }, "suppressed native successful-run handoff recovery for V6 issue");
+      return;
+    }
 
     const issue = await db
       .select({
@@ -8376,6 +8407,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     issueId: string,
   ) {
+    if (await isCrelioV6ExecutionFrozenIssue(db, issueId)) {
+      logger.info({ runId: run.id, issueId }, "suppressed native missing-comment retry for V6 issue");
+      return null;
+    }
     const invokability = await getAgentInvokability(agent);
     if (!invokability.invokable) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -8614,6 +8649,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     now: Date,
   ) {
+    const frozenIssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    if (frozenIssueId && await isCrelioV6ExecutionFrozenIssue(db, frozenIssueId)) {
+      logger.info({ runId: run.id, issueId: frozenIssueId }, "suppressed native process-loss retry for V6 issue");
+      return null;
+    }
     const existingRetry = await db
       .select()
       .from(heartbeatRuns)
@@ -9522,6 +9562,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       delayMs?: number;
     },
   ) {
+    const v6IssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    if (v6IssueId && await isCrelioV6ExecutionFrozenIssue(db, v6IssueId)) {
+      logger.info({ runId: run.id, issueId: v6IssueId }, "suppressed native retry for V6-schema-floor project issue");
+      return { outcome: "not_retryable" as const, reason: "crelio_v6_external_retry_owner" };
+    }
     const now = opts?.now ?? new Date();
     const retryReason = opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
     const wakeReason = opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
@@ -10729,17 +10774,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        responsibleUserId,
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    let v6Claim: typeof heartbeatRuns.$inferSelect | null | undefined;
+    if (issueId) {
+      try {
+        v6Claim = await claimCrelioV6LifecycleRun(db, {
+          runId: run.id,
+          issueId,
+          agentId: run.agentId,
+          responsibleUserId,
+          claimedAt,
+        });
+      } catch (error) {
+        logger.warn({ error, runId: run.id, issueId }, "V6 lifecycle admission rejected a queued run");
+        await cancelRunInternal(
+          run.id,
+          "Cancelled because the V6 lifecycle authorization was missing, stale, expired, or already consumed",
+          { errorCode: "crelio_v6_lifecycle_admission_denied" },
+        );
+        return null;
+      }
+    }
+    const claimed = v6Claim === undefined
+      ? await db
+          .update(heartbeatRuns)
+          .set({
+            status: "running",
+            responsibleUserId,
+            startedAt: run.startedAt ?? claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+          .returning()
+          .then((rows) => rows[0] ?? null)
+      : v6Claim;
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -11841,9 +11908,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })
     ) {
       try {
-        await issuesSvc.checkout(issueId, agent.id, ["todo", "backlog", "blocked"], run.id);
+        await issuesSvc.checkout(
+          issueId,
+          agent.id,
+          ["todo", "backlog", "blocked"],
+          run.id,
+          {
+            crelioV6TransactionHook: async (tx, checkout) => {
+              await appendCrelioV6Journal(tx, {
+                projectId: checkout.binding.projectId,
+                generation: checkout.binding.generation,
+                entityKind: "issue",
+                entityId: checkout.issue.id,
+                entityVersion: checkout.issueVersion,
+                mutationKind: "issue.checked_out",
+                reductionPayload: {
+                  rootIssueId: checkout.binding.rootIssueId,
+                  phase: checkout.binding.phase,
+                  attempt: checkout.binding.currentAttempt,
+                  runId: checkout.runId,
+                  status: checkout.issue.status,
+                  assigneeAgentId: checkout.issue.assigneeAgentId,
+                },
+              });
+            },
+          },
+        );
         context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
       } catch (error) {
+        if (await isCrelioV6ExternallyOwnedIssue(db, issueId)) throw error;
         if (!isCheckoutConflictError(error)) throw error;
         context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = false;
       }
@@ -12323,6 +12416,63 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...effectiveResolvedConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
     };
+    const crelioV6Context = parseObject(context.crelioV6);
+    if (crelioV6Context.schema === 6) {
+      const attempt = Number(crelioV6Context.attempt);
+      if (!Number.isSafeInteger(attempt) || attempt < 1) {
+        throw new Error("schema-v6 run context has an invalid attempt");
+      }
+      const handoffPath = readNonEmptyString(context.handoffPath);
+      const authorizationReceiptSha256 = readNonEmptyString(
+        context.authorizationReceiptSha256,
+      );
+      const contextSha256 = readNonEmptyString(context.contextSha256);
+      const inlineContextPacket = readNonEmptyString(context.inlineContextPacket);
+      const instructionContractSha256 = readNonEmptyString(
+        context.instructionContractSha256,
+      );
+      if (
+        authorizationReceiptSha256 &&
+        !/^[a-f0-9]{64}$/.test(authorizationReceiptSha256)
+      ) {
+        throw new Error("schema-v6 run context has an invalid provider receipt hash");
+      }
+      if (contextSha256 && !/^[a-f0-9]{64}$/.test(contextSha256)) {
+        throw new Error("schema-v6 run context has an invalid context hash");
+      }
+      if (!instructionContractSha256 || !/^[a-f0-9]{64}$/.test(instructionContractSha256)) {
+        throw new Error("schema-v6 run context has no valid instruction contract hash");
+      }
+      if (inlineContextPacket && Buffer.byteLength(inlineContextPacket, "utf8") > 16 * 1024) {
+        throw new Error("schema-v6 inline context packet exceeds 16 KiB");
+      }
+      runtimeConfig = {
+        ...runtimeConfig,
+        env: {
+          ...parseObject(runtimeConfig.env),
+          CRELIO_V6_ATTEMPT: String(attempt),
+          ...(handoffPath ? { CRELIO_V6_HANDOFF_PATH: handoffPath } : {}),
+          ...(contextSha256 ? { CRELIO_V6_CONTEXT_SHA256: contextSha256 } : {}),
+          CRELIO_V6_INSTRUCTION_CONTRACT_SHA256: instructionContractSha256,
+          ...(inlineContextPacket
+            ? {
+                CRELIO_V6_INLINE_CONTEXT_PACKET_B64:
+                  Buffer.from(inlineContextPacket, "utf8").toString("base64"),
+              }
+            : {}),
+          ...(authorizationReceiptSha256
+            ? {
+                CRELIO_V6_AUTHORIZATION_RECEIPT_SHA256:
+                  authorizationReceiptSha256,
+              }
+            : {}),
+        },
+      };
+      context.crelioV6RuntimeContractObserved = assertCrelioV6RuntimeContract(
+        context.crelioV6RuntimeContract,
+        runtimeConfig,
+      );
+    }
     const latestAgentConfigRevision = await getLatestAgentConfigRevision(agent.companyId, agent.id);
     const sessionConfigMetadata = await buildEffectiveRunSessionConfigMetadata({
       adapterType: agent.adapterType,
@@ -12753,7 +12903,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
       if (Object.keys(nextIssuePatch).length > 0) {
-        await issuesSvc.update(issueId, nextIssuePatch);
+        const handledByV6 = await applyCrelioV6RunWorkspaceIssuePatch(db, {
+          issueId,
+          runId: run.id,
+          patch: nextIssuePatch,
+        });
+        if (!handledByV6) await issuesSvc.update(issueId, nextIssuePatch);
       }
     }
     if (persistedExecutionWorkspace) {
@@ -14485,6 +14640,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!issue) return null;
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
 
+      // Schema-v6 issues have an external retry owner. Lock cleanup above still
+      // applies, but no deferred wake, review recovery, process-loss retry, or
+      // liveness repair may be promoted by Paperclip itself.
+      if (await isCrelioV6ExecutionFrozenIssue(tx, issue.id)) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "cancelled",
+            finishedAt: new Date(),
+            error: "Suppressed by Crelio V6 external retry owner",
+            updatedAt: new Date(),
+          })
+          .where(and(
+            eq(agentWakeupRequests.companyId, issue.companyId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+          ));
+        return { kind: "released" as const };
+      }
+
       // Workspace-validation recovery: if the finalizing run failed workspace
       // validation, surface the primary issue for the blocked-recovery comment path.
       // Sibling lock cleanup is already done above; only the primary issue carries
@@ -15290,6 +15465,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // project workspace even when context.projectId wasn't set by the caller.
     if (projectId && !readNonEmptyString(enrichedContextSnapshot.projectId)) {
       enrichedContextSnapshot.projectId = projectId;
+    }
+    if (issueId && await isCrelioV6ExecutionFrozenIssue(db, issueId)) {
+      await writeSkippedRequest("crelio_v6_external_lifecycle_owner", {
+        error: "Wake suppressed because this V6 issue accepts only controller-created lifecycle authorization",
+        payload: {
+          issueId,
+          suppressedReason: reason,
+          suppressedSource: source,
+          suppressedTriggerDetail: triggerDetail,
+        },
+        finishedAt: new Date(),
+      });
+      return null;
     }
     const isolatedWorkspacesEnabled = issueId
       ? (await instanceSettings.getExperimental()).enableIsolatedWorkspaces

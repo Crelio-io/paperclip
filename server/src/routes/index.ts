@@ -11,6 +11,7 @@ export { agentRoutes } from "./agents.js";
 export { projectRoutes } from "./projects.js";
 export { issueRoutes } from "./issues.js";
 export { issueTreeControlRoutes } from "./issue-tree-control.js";
+export { crelioV6Routes, crelioV6StockMutationGuard } from "./crelio-v6.js";
 export { fileResourceRoutes, createFileResourceLimiter } from "./file-resources.js";
 export { routineRoutes } from "./routines.js";
 export { goalRoutes } from "./goals.js";

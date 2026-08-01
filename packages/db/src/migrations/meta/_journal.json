@@ -1275,6 +1275,13 @@
       "when": 1784653200000,
       "tag": "0183_connection_user_authorization_state",
       "breakpoints": true
+    },
+    {
+      "idx": 184,
+      "version": "7",
+      "when": 1785552568591,
+      "tag": "0184_crelio_v6_lifecycle",
+      "breakpoints": true
     }
   ]
 }

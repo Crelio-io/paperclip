@@ -121,6 +121,12 @@ import {
   workProductService,
 } from "../services/index.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
+import {
+  assertCrelioV6ControllerGrant,
+  appendCrelioV6Journal,
+  loadCrelioV6IssueBinding,
+} from "../services/crelio-v6.js";
+import type { AuthorizationActor } from "../services/authorization.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
 import {
   TASK_WATCHDOG_ORIGIN_KIND,
@@ -10416,6 +10422,20 @@ export function issueRoutes(
       res.status(422).json({ error: "Issue does not belong to company" });
       return;
     }
+    const v6Binding = await loadCrelioV6IssueBinding(db, issueId);
+    if (v6Binding) {
+      const fencingGeneration = Number(req.header("x-crelio-controller-generation") ?? "");
+      await assertCrelioV6ControllerGrant(db, {
+        actor: req.actor as AuthorizationActor,
+        projectId: v6Binding.projectId,
+        generation: v6Binding.generation,
+        operation: "issue.attach",
+        fencingGeneration,
+      });
+      if (v6Binding.phase !== "final_handoff" || issue.status !== "backlog") {
+        throw conflict("V6 attachments may be installed only on a backlog Final Handoff");
+      }
+    }
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
 
@@ -10465,17 +10485,40 @@ export function issueRoutes(
       body: file.buffer,
     });
 
-    const attachment = await svc.createAttachment({
-      issueId,
-      issueCommentId: parsedMeta.data.issueCommentId ?? null,
-      provider: stored.provider,
-      objectKey: stored.objectKey,
-      contentType: stored.contentType,
-      byteSize: stored.byteSize,
-      sha256: stored.sha256,
-      originalFilename: stored.originalFilename,
-      createdByAgentId: actor.agentId,
-      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+    const attachment = await db.transaction(async (tx) => {
+      const created = await svc.createAttachment({
+        issueId,
+        issueCommentId: parsedMeta.data.issueCommentId ?? null,
+        provider: stored.provider,
+        objectKey: stored.objectKey,
+        contentType: stored.contentType,
+        byteSize: stored.byteSize,
+        sha256: stored.sha256,
+        originalFilename: stored.originalFilename,
+        createdByAgentId: actor.agentId,
+        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      }, tx);
+      const binding = await loadCrelioV6IssueBinding(tx, issueId);
+      if (binding) {
+        await appendCrelioV6Journal(tx, {
+          projectId: binding.projectId,
+          generation: binding.generation,
+          entityKind: "attachment",
+          entityId: created.id,
+          entityVersion: 1,
+          mutationKind: "attachment.created",
+          reductionPayload: {
+            rootIssueId: binding.rootIssueId,
+            issueId,
+            assetId: created.assetId,
+            contentType: created.contentType,
+            byteSize: created.byteSize,
+            sha256: created.sha256,
+            originalFilename: created.originalFilename,
+          },
+        });
+      }
+      return created;
     });
 
     await logActivity(db, {
@@ -10569,6 +10612,20 @@ export function issueRoutes(
       res.status(404).json({ error: "Issue not found" });
       return;
     }
+    const v6Binding = await loadCrelioV6IssueBinding(db, issue.id);
+    if (v6Binding) {
+      const fencingGeneration = Number(req.header("x-crelio-controller-generation") ?? "");
+      await assertCrelioV6ControllerGrant(db, {
+        actor: req.actor as AuthorizationActor,
+        projectId: v6Binding.projectId,
+        generation: v6Binding.generation,
+        operation: "issue.attach",
+        fencingGeneration,
+      });
+      if (v6Binding.phase !== "final_handoff" || issue.status !== "backlog") {
+        throw conflict("V6 attachments are immutable after Final Handoff activation");
+      }
+    }
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
 
@@ -10578,7 +10635,28 @@ export function issueRoutes(
       logger.warn({ err, attachmentId }, "storage delete failed while removing attachment");
     }
 
-    const removed = await svc.removeAttachment(attachmentId);
+    const removed = await db.transaction(async (tx) => {
+      const deleted = await svc.removeAttachment(attachmentId, tx);
+      if (!deleted) return null;
+      const binding = await loadCrelioV6IssueBinding(tx, deleted.issueId);
+      if (binding) {
+        await appendCrelioV6Journal(tx, {
+          projectId: binding.projectId,
+          generation: binding.generation,
+          entityKind: "attachment",
+          entityId: deleted.id,
+          entityVersion: 2,
+          mutationKind: "attachment.deleted",
+          reductionPayload: {
+            rootIssueId: binding.rootIssueId,
+            issueId: deleted.issueId,
+            assetId: deleted.assetId,
+            sha256: deleted.sha256,
+          },
+        });
+      }
+      return deleted;
+    });
     if (!removed) {
       res.status(404).json({ error: "Attachment not found" });
       return;

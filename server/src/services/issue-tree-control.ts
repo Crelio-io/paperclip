@@ -27,6 +27,7 @@ import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalizatio
 type IssueRow = typeof issues.$inferSelect;
 type HoldRow = typeof issueTreeHolds.$inferSelect;
 type HoldMemberRow = typeof issueTreeHoldMembers.$inferSelect;
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 export type ActiveIssueTreePauseHoldGate = {
   holdId: string;
   rootIssueId: string;
@@ -708,6 +709,7 @@ export function issueTreeControlService(db: Db) {
       reason?: string | null;
       releasePolicy?: IssueTreeHoldReleasePolicy | null;
       actor: ActorInput;
+      transactionHook?: (tx: DbTransaction, hold: HoldRow) => Promise<void>;
     },
   ): Promise<{
     hold: IssueTreeHold;
@@ -765,6 +767,8 @@ export function issueTreeControlService(db: Db) {
             .values(memberRows)
             .returning()
           : [];
+
+        if (input.transactionHook) await input.transactionHook(tx, createdHold);
 
         return { hold: toHold(createdHold, createdMembers) };
       });
@@ -840,6 +844,8 @@ export function issueTreeControlService(db: Db) {
       const createdMembers = memberRows.length > 0
         ? await tx.insert(issueTreeHoldMembers).values(memberRows).returning()
         : [];
+
+      if (input.transactionHook) await input.transactionHook(tx, createdHold);
 
       return { hold: createdHold, members: createdMembers };
     });
@@ -1168,33 +1174,86 @@ export function issueTreeControlService(db: Db) {
     return toHold(updated, members);
   }
 
-  async function cancelUnclaimedWakeupsForTree(companyId: string, rootIssueId: string, reason: string) {
+  async function cancelUnclaimedWakeupsForTree(
+    companyId: string,
+    rootIssueId: string,
+    reason: string,
+    options?: {
+      transactionHook?: (
+        tx: DbTransaction,
+        wakes: Array<typeof agentWakeupRequests.$inferSelect>,
+      ) => Promise<void>;
+    },
+  ) {
     const treeIssues = await listTreeIssues(companyId, rootIssueId);
     const issueIds = treeIssues.map((issue) => issue.id);
     if (issueIds.length === 0) return [];
     const now = new Date();
-    return db
-      .update(agentWakeupRequests)
-      .set({
-        status: "cancelled",
-        finishedAt: now,
-        error: reason,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(agentWakeupRequests.companyId, companyId),
-          inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
-          isNull(agentWakeupRequests.runId),
-          inArray(sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`, issueIds),
+    return db.transaction(async (tx) => {
+      const wakes = await tx
+        .update(agentWakeupRequests)
+        .set({
+          status: "cancelled",
+          finishedAt: now,
+          error: reason,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+            isNull(agentWakeupRequests.runId),
+            inArray(sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`, issueIds),
+          ),
+        )
+        .returning();
+      await options?.transactionHook?.(tx, wakes);
+      return wakes.map((wake) => ({
+        id: wake.id,
+        agentId: wake.agentId,
+        reason: wake.reason,
+        payload: wake.payload,
+      }));
+    });
+  }
+
+  async function readTreeExecutionQuiescence(companyId: string, rootIssueId: string) {
+    const treeIssues = await listTreeIssues(companyId, rootIssueId);
+    const issueIds = treeIssues.map((issue) => issue.id);
+    if (issueIds.length === 0) {
+      return { quiescent: true, activeRunIds: [], runnableWakeIds: [], lockedIssueIds: [] };
+    }
+    const wakeIssueId = sql<string | null>`coalesce(
+      ${agentWakeupRequests.payload} ->> 'issueId',
+      ${agentWakeupRequests.payload} ->> 'taskId',
+      ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId'
+    )`;
+    const [activeRunRows, wakeRows, lockRows] = await Promise.all([
+      activeRunsForTree(companyId, treeIssues),
+      db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+        inArray(wakeIssueId, issueIds),
+      )),
+      db.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.companyId, companyId),
+        inArray(issues.id, issueIds),
+        or(
+          sql`${issues.checkoutRunId} is not null`,
+          sql`${issues.executionRunId} is not null`,
+          sql`${issues.executionLockedAt} is not null`,
         ),
-      )
-      .returning({
-        id: agentWakeupRequests.id,
-        agentId: agentWakeupRequests.agentId,
-        reason: agentWakeupRequests.reason,
-        payload: agentWakeupRequests.payload,
-      });
+      )),
+    ]);
+    const result = {
+      activeRunIds: activeRunRows.map((run) => run.id).sort(),
+      runnableWakeIds: wakeRows.map((wake) => wake.id).sort(),
+      lockedIssueIds: lockRows.map((issue) => issue.id).sort(),
+    };
+    return {
+      quiescent: result.activeRunIds.length === 0 && result.runnableWakeIds.length === 0 && result.lockedIssueIds.length === 0,
+      ...result,
+    };
   }
 
   return {
@@ -1208,5 +1267,6 @@ export function issueTreeControlService(db: Db) {
     getActivePauseHoldGate,
     releaseHold,
     cancelUnclaimedWakeupsForTree,
+    readTreeExecutionQuiescence,
   };
 }

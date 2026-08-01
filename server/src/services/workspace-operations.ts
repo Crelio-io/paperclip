@@ -7,6 +7,7 @@ import { notFound } from "../errors.js";
 import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { getWorkspaceOperationLogStore } from "./workspace-operation-log-store.js";
+import { appendCrelioV6WorkspaceOperationJournal } from "./crelio-v6.js";
 
 type WorkspaceOperationRow = typeof workspaceOperations.$inferSelect;
 
@@ -133,23 +134,26 @@ export function workspaceOperationService(db: Db) {
             });
           };
 
-          await db.insert(workspaceOperations).values({
-            id,
-            companyId: input.companyId,
-            executionWorkspaceId,
-            heartbeatRunId: input.heartbeatRunId ?? null,
-            issueId: input.issueId ?? null,
-            phase: recordInput.phase,
-            command: recordInput.command ?? null,
-            cwd: recordInput.cwd ?? null,
-            status: "running",
-            logStore: handle.store,
-            logRef: handle.logRef,
-            metadata: redactCurrentUserValue(
-              recordInput.metadata ?? null,
-              currentUserRedactionOptions,
-            ) as Record<string, unknown> | null,
-            startedAt,
+          await db.transaction(async (tx) => {
+            const started = await tx.insert(workspaceOperations).values({
+              id,
+              companyId: input.companyId,
+              executionWorkspaceId,
+              heartbeatRunId: input.heartbeatRunId ?? null,
+              issueId: input.issueId ?? null,
+              phase: recordInput.phase,
+              command: recordInput.command ?? null,
+              cwd: recordInput.cwd ?? null,
+              status: "running",
+              logStore: handle.store,
+              logRef: handle.logRef,
+              metadata: redactCurrentUserValue(
+                recordInput.metadata ?? null,
+                currentUserRedactionOptions,
+              ) as Record<string, unknown> | null,
+              startedAt,
+            }).returning().then((rows) => rows[0]);
+            await appendCrelioV6WorkspaceOperationJournal(tx, started);
           });
           createdIds.push(id);
 
@@ -160,47 +164,56 @@ export function workspaceOperationService(db: Db) {
             await append("stderr", result.stderr ?? null);
             const finalized = await logStore.finalize(handle);
             const finishedAt = new Date();
-            const row = await db
-              .update(workspaceOperations)
-              .set({
-                executionWorkspaceId,
-                status: result.status ?? "succeeded",
-                exitCode: result.exitCode ?? null,
-                stdoutExcerpt: stdoutExcerpt || null,
-                stderrExcerpt: stderrExcerpt || null,
-                logBytes: finalized.bytes,
-                logSha256: finalized.sha256,
-                logCompressed: finalized.compressed,
-                metadata: redactCurrentUserValue(
-                  combineMetadata(recordInput.metadata, result.metadata),
-                  currentUserRedactionOptions,
-                ) as Record<string, unknown> | null,
-                finishedAt,
-                updatedAt: finishedAt,
-              })
-              .where(eq(workspaceOperations.id, id))
-              .returning()
-              .then((rows) => rows[0] ?? null);
+            const row = await db.transaction(async (tx) => {
+              const updated = await tx
+                .update(workspaceOperations)
+                .set({
+                  executionWorkspaceId,
+                  status: result.status ?? "succeeded",
+                  exitCode: result.exitCode ?? null,
+                  stdoutExcerpt: stdoutExcerpt || null,
+                  stderrExcerpt: stderrExcerpt || null,
+                  logBytes: finalized.bytes,
+                  logSha256: finalized.sha256,
+                  logCompressed: finalized.compressed,
+                  metadata: redactCurrentUserValue(
+                    combineMetadata(recordInput.metadata, result.metadata),
+                    currentUserRedactionOptions,
+                  ) as Record<string, unknown> | null,
+                  finishedAt,
+                  updatedAt: finishedAt,
+                })
+                .where(eq(workspaceOperations.id, id))
+                .returning()
+                .then((rows) => rows[0] ?? null);
+              if (updated) await appendCrelioV6WorkspaceOperationJournal(tx, updated);
+              return updated;
+            });
             if (!row) throw notFound("Workspace operation not found");
             return toWorkspaceOperation(row);
           } catch (error) {
             await append("stderr", error instanceof Error ? error.message : String(error));
             const finalized = await logStore.finalize(handle).catch(() => null);
             const finishedAt = new Date();
-            await db
-              .update(workspaceOperations)
-              .set({
-                executionWorkspaceId,
-                status: "failed",
-                stdoutExcerpt: stdoutExcerpt || null,
-                stderrExcerpt: stderrExcerpt || null,
-                logBytes: finalized?.bytes ?? null,
-                logSha256: finalized?.sha256 ?? null,
-                logCompressed: finalized?.compressed ?? false,
-                finishedAt,
-                updatedAt: finishedAt,
-              })
-              .where(eq(workspaceOperations.id, id));
+            await db.transaction(async (tx) => {
+              const failed = await tx
+                .update(workspaceOperations)
+                .set({
+                  executionWorkspaceId,
+                  status: "failed",
+                  stdoutExcerpt: stdoutExcerpt || null,
+                  stderrExcerpt: stderrExcerpt || null,
+                  logBytes: finalized?.bytes ?? null,
+                  logSha256: finalized?.sha256 ?? null,
+                  logCompressed: finalized?.compressed ?? false,
+                  finishedAt,
+                  updatedAt: finishedAt,
+                })
+                .where(eq(workspaceOperations.id, id))
+                .returning()
+                .then((rows) => rows[0] ?? null);
+              if (failed) await appendCrelioV6WorkspaceOperationJournal(tx, failed);
+            });
             throw error;
           }
         },

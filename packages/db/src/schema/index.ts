@@ -79,6 +79,18 @@ export { inboxDismissals } from "./inbox_dismissals.js";
 export { feedbackVotes } from "./feedback_votes.js";
 export { decisionTrainingExamples } from "./decision_training_examples.js";
 export { feedbackExports } from "./feedback_exports.js";
+export {
+  crelioV6ApprovalSubjects,
+  crelioV6CompletionReceipts,
+  crelioV6ControllerGrants,
+  crelioV6IssueBindings,
+  crelioV6JournalEvents,
+  crelioV6JournalHeads,
+  crelioV6LegacyFreezes,
+  crelioV6LifecycleAuthorizations,
+  crelioV6ProjectPolicies,
+  crelioV6SnapshotSessions,
+} from "./crelio_v6.js";
 export { issueReadStates } from "./issue_read_states.js";
 export { assets } from "./assets.js";
 export { issueAttachments } from "./issue_attachments.js";
