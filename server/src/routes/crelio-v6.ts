@@ -209,13 +209,34 @@ function parseNonNegativeQueryInteger(value: unknown, fallback = 0) {
   return parsed;
 }
 
-async function assertBoardProjectRead(db: Db, req: Request, projectId: string) {
+async function assertBoardProjectRead(
+  db: Db,
+  req: Request,
+  projectId: string,
+  policy: {
+    preparedControllerUserId?: string | null;
+    preparedControllerApiKeyId?: string | null;
+    controllerUserId?: string | null;
+    controllerApiKeyId?: string | null;
+  } | null,
+) {
   const current = actor(req);
   if (current.type !== "board" || !current.userId) throw forbidden("Board authentication is required");
   const project = await db.select({ companyId: projects.companyId }).from(projects)
     .where(eq(projects.id, projectId)).then((rows) => rows[0] ?? null);
   if (!project) return;
-  if (!current.isInstanceAdmin && !current.companyIds?.includes(project.companyId)) {
+  const exactPreparedController = current.source === "board_key"
+    && current.userId === policy?.preparedControllerUserId
+    && current.keyId === policy?.preparedControllerApiKeyId;
+  const exactActiveController = current.source === "board_key"
+    && current.userId === policy?.controllerUserId
+    && current.keyId === policy?.controllerApiKeyId;
+  if (
+    !current.isInstanceAdmin
+    && !current.companyIds?.includes(project.companyId)
+    && !exactPreparedController
+    && !exactActiveController
+  ) {
     throw forbidden("Project is outside the authenticated board user's companies");
   }
 }
@@ -226,8 +247,8 @@ export function crelioV6Routes(db: Db) {
   const heartbeat = heartbeatService(db);
 
   router.get("/projects/:projectId/v6-generation", async (req, res) => {
-    await assertBoardProjectRead(db, req, req.params.projectId);
     const policy = await svc.getProjectPolicy(req.params.projectId);
+    await assertBoardProjectRead(db, req, req.params.projectId, policy);
     if (!policy) return res.status(404).json({ error: "V6 project policy not found" });
     res.json(policy);
   });

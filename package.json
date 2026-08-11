@@ -81,10 +81,11 @@
       "acpx@0.12.0": "patches/acpx@0.12.0.patch"
     },
     "overrides": {
-      "fast-uri": "3.1.4",
+      "fast-uri": "3.1.5",
       "hono": "4.12.25",
       "path-to-regexp": "8.4.0",
-      "undici": "7.28.0",
+      "undici": "7.29.0",
+      "ip-address": "10.3.1",
       "rollup": ">=4.59.0",
       "react": "^19.2.7",
       "react-dom": "^19.2.7",
