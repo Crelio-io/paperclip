@@ -40,6 +40,7 @@ import { boardAuthService } from "../services/board-auth.js";
 import { crelioV6MaintenanceMutationGuard } from "../app.js";
 import { errorHandler } from "../middleware/index.js";
 import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
+import { crelioV6Routes } from "../routes/crelio-v6.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -206,6 +207,62 @@ describePostgres("Crelio V6 lifecycle extension", () => {
     await db.insert(projects).values({ id: projectId, companyId, name });
     return { companyId, projectId, agentId, userId };
   }
+
+  it("allows only the exact prepared or active controller key to read generation state without broad company membership", async () => {
+    const seeded = await base("GenerationGrantRead");
+    const preparedKeyId = randomUUID();
+    const activeKeyId = randomUUID();
+    const alternateKeyId = randomUUID();
+    await db.insert(boardApiKeys).values([
+      { id: preparedKeyId, userId: seeded.userId, name: "prepared-controller", keyHash: crelioV6Sha256("generation-read-prepared-key") },
+      { id: activeKeyId, userId: seeded.userId, name: "active-controller", keyHash: crelioV6Sha256("generation-read-active-key") },
+      { id: alternateKeyId, userId: seeded.userId, name: "alternate-controller", keyHash: crelioV6Sha256("generation-read-alternate-key") },
+    ]);
+    await db.insert(crelioV6ProjectPolicies).values({
+      projectId: seeded.projectId,
+      companyId: seeded.companyId,
+      schemaFloor: 6,
+      preparedGeneration: "generation-next",
+      activeGeneration: "generation-current",
+      preparedControllerUserId: seeded.userId,
+      preparedControllerApiKeyId: preparedKeyId,
+      controllerUserId: seeded.userId,
+      controllerApiKeyId: activeKeyId,
+      preparedFencingGeneration: 2,
+      activeFencingGeneration: 1,
+    });
+
+    const app = (keyId: string, source: "board_key" | "session" = "board_key") => {
+      const instance = express();
+      instance.use((req, _res, next) => {
+        req.actor = {
+          type: "board",
+          source,
+          userId: seeded.userId,
+          keyId,
+          companyIds: [],
+          isInstanceAdmin: false,
+        } as any;
+        next();
+      });
+      instance.use("/api", crelioV6Routes(db));
+      instance.use(errorHandler);
+      return instance;
+    };
+
+    await request(app(preparedKeyId))
+      .get(`/api/projects/${seeded.projectId}/v6-generation`)
+      .expect(200);
+    await request(app(activeKeyId))
+      .get(`/api/projects/${seeded.projectId}/v6-generation`)
+      .expect(200);
+    await request(app(alternateKeyId))
+      .get(`/api/projects/${seeded.projectId}/v6-generation`)
+      .expect(403);
+    await request(app(preparedKeyId, "session"))
+      .get(`/api/projects/${seeded.projectId}/v6-generation`)
+      .expect(403);
+  });
 
   it("rejects an unauthorized queued legacy run after the project schema floor reaches V6", async () => {
     const seeded = await base("LegacyFreeze");
